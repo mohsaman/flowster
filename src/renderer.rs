@@ -385,12 +385,14 @@ fn build_msg_label(protocol: &str, info: &str, src_x: f32, dst_x: f32) -> String
 
 /// Truncate a string to max_len characters, appending "..." if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
     } else if max_len <= 3 {
-        s[..max_len].to_string()
+        s.chars().take(max_len).collect()
     } else {
-        format!("{}...", &s[..max_len - 3])
+        let truncated: String = s.chars().take(max_len - 3).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -399,5 +401,5 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 fn estimate_text_width(text: &str, font_size_pt: f32) -> f32 {
     let avg_char_width_pt = 0.50 * font_size_pt;
     let avg_char_width_mm = avg_char_width_pt * 0.3528; // 1pt ≈ 0.3528mm
-    text.len() as f32 * avg_char_width_mm
+    text.chars().count() as f32 * avg_char_width_mm
 }
