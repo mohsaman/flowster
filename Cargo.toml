@@ -1,0 +1,15 @@
+[package]
+name = "flowster"
+version = "0.1.0"
+edition = "2021"
+description = "Generate PDF signaling flow diagrams from Wireshark pcapng captures"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+printpdf = "0.7"
+anyhow = "1"
+indexmap = "2"
+
+[profile.release]
+opt-level = 2
