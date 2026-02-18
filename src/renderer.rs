@@ -206,9 +206,24 @@ fn draw_node_headers(
 ) {
     let box_top = header_y - 4.0;
 
+    // Shrink box width if nodes are closely spaced, to prevent overlap.
+    let min_spacing = if node_x.len() > 1 {
+        node_x.windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(f32::MAX, f32::min)
+    } else {
+        NODE_BOX_WIDTH
+    };
+    let effective_box_width = (min_spacing * 0.85).min(NODE_BOX_WIDTH);
+
+    // Max chars that fit inside the box (2mm padding each side).
+    let char_width_mm = 0.50 * FONT_SIZE_NODE * 0.3528;
+    let max_chars = ((effective_box_width - 4.0) / char_width_mm).floor() as usize;
+    let max_chars = max_chars.max(5);
+
     for (i, node) in diagram.nodes.iter().enumerate() {
         let cx = node_x[i];
-        let bx = cx - NODE_BOX_WIDTH / 2.0;
+        let bx = cx - effective_box_width / 2.0;
         let by = box_top - NODE_BOX_HEIGHT;
 
         // Box background
@@ -216,19 +231,59 @@ fn draw_node_headers(
         layer.set_outline_color(Color::Rgb(Rgb::new(0.30, 0.40, 0.65, None)));
         layer.set_outline_thickness(0.8);
 
-        let rect = Rect::new(Mm(bx), Mm(by), Mm(bx + NODE_BOX_WIDTH), Mm(box_top))
+        let rect = Rect::new(Mm(bx), Mm(by), Mm(bx + effective_box_width), Mm(box_top))
             .with_mode(PaintMode::FillStroke);
         layer.add_rect(rect);
 
-        // Node label - truncate if needed
-        let label = truncate_str(&node.address, 20);
-        // Center text approximately
-        let text_x = cx - estimate_text_width(&label, FONT_SIZE_NODE) / 2.0;
-        let text_y = by + NODE_BOX_HEIGHT / 2.0 - 1.0;
-
         layer.set_fill_color(Color::Rgb(Rgb::new(0.10, 0.10, 0.30, None)));
-        layer.use_text(&label, FONT_SIZE_NODE, Mm(text_x), Mm(text_y), font_bold);
+
+        let (line1, line2) = split_node_label(&node.address, max_chars);
+        if let Some(ref l2) = line2 {
+            // Two-line rendering: upper and lower halves of the box.
+            let text_y1 = by + NODE_BOX_HEIGHT * 0.65;
+            let text_y2 = by + NODE_BOX_HEIGHT * 0.28;
+            let tw1 = estimate_text_width(&line1, FONT_SIZE_NODE);
+            let tw2 = estimate_text_width(l2, FONT_SIZE_NODE);
+            layer.use_text(&line1, FONT_SIZE_NODE, Mm(cx - tw1 / 2.0), Mm(text_y1), font_bold);
+            layer.use_text(l2, FONT_SIZE_NODE, Mm(cx - tw2 / 2.0), Mm(text_y2), font_bold);
+        } else {
+            let text_x = cx - estimate_text_width(&line1, FONT_SIZE_NODE) / 2.0;
+            let text_y = by + NODE_BOX_HEIGHT / 2.0 - 1.0;
+            layer.use_text(&line1, FONT_SIZE_NODE, Mm(text_x), Mm(text_y), font_bold);
+        }
     }
+}
+
+/// Split a node address into one or two display lines, each within max_chars.
+/// Prefers splitting at a natural separator (`.` or `:`) nearest the midpoint.
+fn split_node_label(addr: &str, max_chars: usize) -> (String, Option<String>) {
+    if addr.chars().count() <= max_chars {
+        return (addr.to_string(), None);
+    }
+
+    let chars: Vec<char> = addr.chars().collect();
+    let len = chars.len();
+    let mid = len / 2;
+
+    // Find separator nearest to mid; include it at the end of line 1.
+    let split_after = (0..len)
+        .filter(|&i| chars[i] == '.' || chars[i] == ':')
+        .min_by_key(|&i| (i as isize - mid as isize).unsigned_abs());
+
+    let split_pos = split_after.unwrap_or(mid.min(max_chars).saturating_sub(1));
+    let line2_start = (split_pos + 1).min(len);
+
+    let line1: String = chars[..=split_pos].iter().collect();
+    let line2: String = chars[line2_start..].iter().collect();
+
+    if line2.is_empty() {
+        return (truncate_str(&line1, max_chars), None);
+    }
+
+    (
+        truncate_str(&line1, max_chars),
+        Some(truncate_str(&line2, max_chars)),
+    )
 }
 
 /// Draw dashed vertical lifelines from under each node header to the bottom.
