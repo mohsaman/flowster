@@ -1,9 +1,10 @@
 use crate::colors::protocol_color;
-use crate::model::SignalingDiagram;
+use crate::model::{Message, SignalingDiagram};
 use anyhow::{Context, Result};
 use chrono::Local;
 use printpdf::path::{PaintMode, WindingOrder};
 use printpdf::*;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::BufWriter;
 
@@ -22,6 +23,7 @@ const ARROWHEAD_LEN: f32 = 2.5; // Arrowhead length in mm
 const ARROWHEAD_WIDTH: f32 = 1.5; // Arrowhead half-width in mm
 const SELF_LOOP_WIDTH: f32 = 12.0; // Width of self-message loop
 const LIFELINE_DASH: i64 = 4; // Dash length for lifelines
+const MAX_NODES_PER_PAGE: usize = 10; // Max active node columns per page
 
 // Font sizes (in points)
 const FONT_SIZE_TITLE: f32 = 14.0;
@@ -48,13 +50,9 @@ pub fn render_pdf(
     let usable_msg_height = first_msg_y - BOTTOM_MARGIN;
     let msgs_per_page = (usable_msg_height / ROW_HEIGHT).floor() as usize;
 
-    // Paginate messages
-    let total_messages = diagram.messages.len();
-    let total_pages = if total_messages == 0 {
-        1
-    } else {
-        (total_messages + msgs_per_page - 1) / msgs_per_page
-    };
+    // Smart pagination: limit pages by both vertical space AND max active nodes
+    let pages = paginate_messages(&diagram.messages, msgs_per_page, MAX_NODES_PER_PAGE);
+    let total_pages = pages.len().max(1);
 
     // Create PDF document
     let doc_title = title.unwrap_or("Signaling Flow Diagram");
@@ -73,17 +71,20 @@ pub fn render_pdf(
 
     for page_num in 0..total_pages {
         // --- Determine which messages belong to this page ---
-        let start_idx = page_num * msgs_per_page;
-        let end_idx = (start_idx + msgs_per_page).min(total_messages);
+        let (start_idx, end_idx) = if page_num < pages.len() {
+            pages[page_num]
+        } else {
+            (0, 0)
+        };
 
         // --- Collect active node indices for this page (preserve original order) ---
-        let mut active_set = std::collections::BTreeSet::new();
+        let mut active_set = BTreeSet::new();
         for msg_idx in start_idx..end_idx {
             let msg = &diagram.messages[msg_idx];
             active_set.insert(msg.source_idx);
             active_set.insert(msg.dest_idx);
         }
-        let active_nodes: Vec<usize> = active_set.into_iter().collect(); // sorted by original index
+        let active_nodes: Vec<usize> = active_set.into_iter().collect();
         let active_count = active_nodes.len().max(1);
 
         // --- Compute X positions for active nodes only ---
@@ -229,6 +230,46 @@ pub fn render_pdf(
         .context("Failed to write PDF")?;
 
     Ok(())
+}
+
+/// Smart pagination: group messages into pages limited by both vertical space
+/// AND maximum active node count. Returns vec of (start_idx, end_idx) ranges.
+fn paginate_messages(
+    messages: &[Message],
+    max_rows: usize,
+    max_nodes: usize,
+) -> Vec<(usize, usize)> {
+    if messages.is_empty() {
+        return vec![(0, 0)];
+    }
+
+    let mut pages = Vec::new();
+    let mut start = 0;
+
+    while start < messages.len() {
+        let mut active_set = BTreeSet::new();
+        let mut end = start;
+
+        while end < messages.len() && end - start < max_rows {
+            let msg = &messages[end];
+            let mut test_set = active_set.clone();
+            test_set.insert(msg.source_idx);
+            test_set.insert(msg.dest_idx);
+
+            // If adding this message exceeds the node limit, break (unless page is empty)
+            if test_set.len() > max_nodes && end > start {
+                break;
+            }
+
+            active_set = test_set;
+            end += 1;
+        }
+
+        pages.push((start, end));
+        start = end;
+    }
+
+    pages
 }
 
 /// Draw header boxes only for the active nodes on this page.
