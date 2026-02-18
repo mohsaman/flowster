@@ -1,6 +1,7 @@
 use crate::colors::protocol_color;
 use crate::model::SignalingDiagram;
 use anyhow::{Context, Result};
+use chrono::Local;
 use printpdf::path::{PaintMode, WindingOrder};
 use printpdf::*;
 use std::fs::File;
@@ -107,12 +108,26 @@ pub fn render_pdf(
             }
         }
 
-        // --- Draw page number ---
+        // --- Draw author + date at top right (every page) ---
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let author_line = format!("Author: Mo Saman    {}", today);
+        let author_w = estimate_text_width(&author_line, FONT_SIZE_PAGE);
+        layer.set_fill_color(Color::Rgb(Rgb::new(0.3, 0.3, 0.3, None)));
+        layer.use_text(
+            &author_line,
+            FONT_SIZE_PAGE,
+            Mm(PAGE_WIDTH - RIGHT_MARGIN - author_w),
+            Mm(header_y + 2.0),
+            &font_regular,
+        );
+
+        // --- Draw page number at bottom left (every page) ---
         let page_label = format!("Page {} / {}", page_num + 1, total_pages);
+        layer.set_fill_color(Color::Rgb(Rgb::new(0.3, 0.3, 0.3, None)));
         layer.use_text(
             &page_label,
             FONT_SIZE_PAGE,
-            Mm(PAGE_WIDTH - RIGHT_MARGIN - 20.0),
+            Mm(LEFT_MARGIN),
             Mm(BOTTOM_MARGIN / 2.0),
             &font_regular,
         );
