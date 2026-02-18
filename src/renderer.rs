@@ -1,8 +1,10 @@
 use crate::colors::protocol_color;
-use crate::model::SignalingDiagram;
+use crate::model::{Message, SignalingDiagram};
 use anyhow::{Context, Result};
+use chrono::Local;
 use printpdf::path::{PaintMode, WindingOrder};
 use printpdf::*;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::BufWriter;
 
@@ -21,6 +23,7 @@ const ARROWHEAD_LEN: f32 = 2.5; // Arrowhead length in mm
 const ARROWHEAD_WIDTH: f32 = 1.5; // Arrowhead half-width in mm
 const SELF_LOOP_WIDTH: f32 = 12.0; // Width of self-message loop
 const LIFELINE_DASH: i64 = 4; // Dash length for lifelines
+const MAX_NODES_PER_PAGE: usize = 10; // Max active node columns per page
 
 // Font sizes (in points)
 const FONT_SIZE_TITLE: f32 = 14.0;
@@ -47,29 +50,9 @@ pub fn render_pdf(
     let usable_msg_height = first_msg_y - BOTTOM_MARGIN;
     let msgs_per_page = (usable_msg_height / ROW_HEIGHT).floor() as usize;
 
-    // Calculate node X positions (evenly spaced)
-    let node_spacing = if node_count > 1 {
-        usable_width / (node_count as f32 - 1.0).max(1.0)
-    } else {
-        0.0
-    };
-    let node_x: Vec<f32> = (0..node_count)
-        .map(|i| {
-            if node_count == 1 {
-                LEFT_MARGIN + usable_width / 2.0
-            } else {
-                LEFT_MARGIN + i as f32 * node_spacing
-            }
-        })
-        .collect();
-
-    // Paginate messages
-    let total_messages = diagram.messages.len();
-    let total_pages = if total_messages == 0 {
-        1
-    } else {
-        (total_messages + msgs_per_page - 1) / msgs_per_page
-    };
+    // Smart pagination: limit pages by both vertical space AND max active nodes
+    let pages = paginate_messages(&diagram.messages, msgs_per_page, MAX_NODES_PER_PAGE);
+    let total_pages = pages.len().max(1);
 
     // Create PDF document
     let doc_title = title.unwrap_or("Signaling Flow Diagram");
@@ -87,6 +70,46 @@ pub fn render_pdf(
         .context("Failed to add Courier font")?;
 
     for page_num in 0..total_pages {
+        // --- Determine which messages belong to this page ---
+        let (start_idx, end_idx) = if page_num < pages.len() {
+            pages[page_num]
+        } else {
+            (0, 0)
+        };
+
+        // --- Collect active node indices for this page (preserve original order) ---
+        let mut active_set = BTreeSet::new();
+        for msg_idx in start_idx..end_idx {
+            let msg = &diagram.messages[msg_idx];
+            active_set.insert(msg.source_idx);
+            active_set.insert(msg.dest_idx);
+        }
+        let active_nodes: Vec<usize> = active_set.into_iter().collect();
+        let active_count = active_nodes.len().max(1);
+
+        // --- Compute X positions for active nodes only ---
+        let node_spacing = if active_count > 1 {
+            usable_width / (active_count as f32 - 1.0)
+        } else {
+            0.0
+        };
+        let page_node_x: Vec<f32> = (0..active_count)
+            .map(|i| {
+                if active_count == 1 {
+                    LEFT_MARGIN + usable_width / 2.0
+                } else {
+                    LEFT_MARGIN + i as f32 * node_spacing
+                }
+            })
+            .collect();
+
+        // Map from global node index to page-local X position
+        let node_x_map: std::collections::HashMap<usize, f32> = active_nodes
+            .iter()
+            .enumerate()
+            .map(|(local_i, &global_i)| (global_i, page_node_x[local_i]))
+            .collect();
+
         let (current_page, current_layer) = if page_num == 0 {
             (page1, layer1)
         } else {
@@ -107,29 +130,44 @@ pub fn render_pdf(
             }
         }
 
-        // --- Draw page number ---
+        // --- Draw author + date at top right (every page) ---
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let author_line = format!("Author: Mo Saman    {}", today);
+        let author_w = estimate_text_width(&author_line, FONT_SIZE_PAGE);
+        layer.set_fill_color(Color::Rgb(Rgb::new(0.3, 0.3, 0.3, None)));
+        layer.use_text(
+            &author_line,
+            FONT_SIZE_PAGE,
+            Mm(PAGE_WIDTH - RIGHT_MARGIN - author_w),
+            Mm(header_y + 2.0),
+            &font_regular,
+        );
+
+        // --- Draw page number at bottom left (every page) ---
         let page_label = format!("Page {} / {}", page_num + 1, total_pages);
+        layer.set_fill_color(Color::Rgb(Rgb::new(0.3, 0.3, 0.3, None)));
         layer.use_text(
             &page_label,
             FONT_SIZE_PAGE,
-            Mm(PAGE_WIDTH - RIGHT_MARGIN - 20.0),
+            Mm(LEFT_MARGIN),
             Mm(BOTTOM_MARGIN / 2.0),
             &font_regular,
         );
 
-        // --- Draw node header boxes and labels ---
-        draw_node_headers(
+        // --- Draw node header boxes and labels (active nodes only) ---
+        draw_node_headers_active(
             &layer,
             diagram,
-            &node_x,
+            &active_nodes,
+            &page_node_x,
             header_y,
             &font_bold,
         );
 
-        // --- Draw lifelines (dashed vertical lines) ---
+        // --- Draw lifelines (dashed vertical lines, active nodes only) ---
         draw_lifelines(
             &layer,
-            &node_x,
+            &page_node_x,
             header_y - NODE_BOX_HEIGHT,
             BOTTOM_MARGIN,
         );
@@ -140,9 +178,6 @@ pub fn render_pdf(
         layer.use_text("Time", FONT_SIZE_TIMESTAMP, Mm(14.0), Mm(header_y - 5.0), &font_bold);
 
         // --- Draw messages for this page ---
-        let start_idx = page_num * msgs_per_page;
-        let end_idx = (start_idx + msgs_per_page).min(total_messages);
-
         for (row, msg_idx) in (start_idx..end_idx).enumerate() {
             let msg = &diagram.messages[msg_idx];
             let y = first_msg_y - (row as f32 + 0.5) * ROW_HEIGHT;
@@ -158,11 +193,14 @@ pub fn render_pdf(
             // Get protocol color
             let color = protocol_color(&msg.protocol);
 
+            let src_x = node_x_map[&msg.source_idx];
+            let dst_x = node_x_map[&msg.dest_idx];
+
             if msg.source_idx == msg.dest_idx {
                 // Self-message: draw a loop
                 draw_self_message(
                     &layer,
-                    node_x[msg.source_idx],
+                    src_x,
                     y,
                     &msg.protocol,
                     &msg.info,
@@ -171,8 +209,6 @@ pub fn render_pdf(
                 );
             } else {
                 // Normal message arrow
-                let src_x = node_x[msg.source_idx];
-                let dst_x = node_x[msg.dest_idx];
                 draw_message_arrow(
                     &layer,
                     src_x,
@@ -196,19 +232,77 @@ pub fn render_pdf(
     Ok(())
 }
 
-/// Draw the node header boxes at the top of the page.
-fn draw_node_headers(
+/// Smart pagination: group messages into pages limited by both vertical space
+/// AND maximum active node count. Returns vec of (start_idx, end_idx) ranges.
+fn paginate_messages(
+    messages: &[Message],
+    max_rows: usize,
+    max_nodes: usize,
+) -> Vec<(usize, usize)> {
+    if messages.is_empty() {
+        return vec![(0, 0)];
+    }
+
+    let mut pages = Vec::new();
+    let mut start = 0;
+
+    while start < messages.len() {
+        let mut active_set = BTreeSet::new();
+        let mut end = start;
+
+        while end < messages.len() && end - start < max_rows {
+            let msg = &messages[end];
+            let mut test_set = active_set.clone();
+            test_set.insert(msg.source_idx);
+            test_set.insert(msg.dest_idx);
+
+            // If adding this message exceeds the node limit, break (unless page is empty)
+            if test_set.len() > max_nodes && end > start {
+                break;
+            }
+
+            active_set = test_set;
+            end += 1;
+        }
+
+        pages.push((start, end));
+        start = end;
+    }
+
+    pages
+}
+
+/// Draw header boxes only for the active nodes on this page.
+fn draw_node_headers_active(
     layer: &PdfLayerReference,
     diagram: &SignalingDiagram,
-    node_x: &[f32],
+    active_nodes: &[usize],
+    page_node_x: &[f32],
     header_y: f32,
     font_bold: &IndirectFontRef,
 ) {
     let box_top = header_y - 4.0;
 
-    for (i, node) in diagram.nodes.iter().enumerate() {
-        let cx = node_x[i];
-        let bx = cx - NODE_BOX_WIDTH / 2.0;
+    // Shrink box width if nodes are closely spaced, to prevent overlap.
+    let min_spacing = if page_node_x.len() > 1 {
+        page_node_x
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(f32::MAX, f32::min)
+    } else {
+        NODE_BOX_WIDTH
+    };
+    let effective_box_width = (min_spacing * 0.85).min(NODE_BOX_WIDTH);
+
+    // Max chars that fit inside the box (2mm padding each side).
+    let char_width_mm = 0.50 * FONT_SIZE_NODE * 0.3528;
+    let max_chars = ((effective_box_width - 4.0) / char_width_mm).floor() as usize;
+    let max_chars = max_chars.max(5);
+
+    for (local_i, &global_i) in active_nodes.iter().enumerate() {
+        let node = &diagram.nodes[global_i];
+        let cx = page_node_x[local_i];
+        let bx = cx - effective_box_width / 2.0;
         let by = box_top - NODE_BOX_HEIGHT;
 
         // Box background
@@ -216,19 +310,58 @@ fn draw_node_headers(
         layer.set_outline_color(Color::Rgb(Rgb::new(0.30, 0.40, 0.65, None)));
         layer.set_outline_thickness(0.8);
 
-        let rect = Rect::new(Mm(bx), Mm(by), Mm(bx + NODE_BOX_WIDTH), Mm(box_top))
+        let rect = Rect::new(Mm(bx), Mm(by), Mm(bx + effective_box_width), Mm(box_top))
             .with_mode(PaintMode::FillStroke);
         layer.add_rect(rect);
 
-        // Node label - truncate if needed
-        let label = truncate_str(&node.address, 20);
-        // Center text approximately
-        let text_x = cx - estimate_text_width(&label, FONT_SIZE_NODE) / 2.0;
-        let text_y = by + NODE_BOX_HEIGHT / 2.0 - 1.0;
-
         layer.set_fill_color(Color::Rgb(Rgb::new(0.10, 0.10, 0.30, None)));
-        layer.use_text(&label, FONT_SIZE_NODE, Mm(text_x), Mm(text_y), font_bold);
+
+        let (line1, line2) = split_node_label(&node.address, max_chars);
+        if let Some(ref l2) = line2 {
+            let text_y1 = by + NODE_BOX_HEIGHT * 0.65;
+            let text_y2 = by + NODE_BOX_HEIGHT * 0.28;
+            let tw1 = estimate_text_width(&line1, FONT_SIZE_NODE);
+            let tw2 = estimate_text_width(l2, FONT_SIZE_NODE);
+            layer.use_text(&line1, FONT_SIZE_NODE, Mm(cx - tw1 / 2.0), Mm(text_y1), font_bold);
+            layer.use_text(l2, FONT_SIZE_NODE, Mm(cx - tw2 / 2.0), Mm(text_y2), font_bold);
+        } else {
+            let text_x = cx - estimate_text_width(&line1, FONT_SIZE_NODE) / 2.0;
+            let text_y = by + NODE_BOX_HEIGHT / 2.0 - 1.0;
+            layer.use_text(&line1, FONT_SIZE_NODE, Mm(text_x), Mm(text_y), font_bold);
+        }
     }
+}
+
+/// Split a node address into one or two display lines, each within max_chars.
+/// Prefers splitting at a natural separator (`.` or `:`) nearest the midpoint.
+fn split_node_label(addr: &str, max_chars: usize) -> (String, Option<String>) {
+    if addr.chars().count() <= max_chars {
+        return (addr.to_string(), None);
+    }
+
+    let chars: Vec<char> = addr.chars().collect();
+    let len = chars.len();
+    let mid = len / 2;
+
+    // Find separator nearest to mid; include it at the end of line 1.
+    let split_after = (0..len)
+        .filter(|&i| chars[i] == '.' || chars[i] == ':')
+        .min_by_key(|&i| (i as isize - mid as isize).unsigned_abs());
+
+    let split_pos = split_after.unwrap_or(mid.min(max_chars).saturating_sub(1));
+    let line2_start = (split_pos + 1).min(len);
+
+    let line1: String = chars[..=split_pos].iter().collect();
+    let line2: String = chars[line2_start..].iter().collect();
+
+    if line2.is_empty() {
+        return (truncate_str(&line1, max_chars), None);
+    }
+
+    (
+        truncate_str(&line1, max_chars),
+        Some(truncate_str(&line2, max_chars)),
+    )
 }
 
 /// Draw dashed vertical lifelines from under each node header to the bottom.
